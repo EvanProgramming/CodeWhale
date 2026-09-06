@@ -10,21 +10,9 @@ import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { run, runOk, ExecError, tryJson } from "../exec.mjs";
 
-function ps(script, opts = {}) {
-  const encoded = Buffer.from(script, "utf16le").toString("base64");
-  return run("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
-    timeoutMs: opts.timeoutMs ?? 25_000,
-    maxBuffer: 32 * 1024 * 1024,
-  });
-}
-
-async function psJson(script, opts = {}) {
-  const r = await ps(script, opts);
-  const out = r.stdout.trim();
-  const j = tryJson(out, null);
-  if (!j) throw new ExecError(`powershell did not return JSON: ${(r.stderr || out).trim().slice(0, 300)}`, r);
-  return j;
-}
+// One-shot PowerShell runner is defined per `create()` instance below so a
+// test can inject a fake runner; the shared bootstrap type and every action
+// script are assembled against that instance-local runner.
 
 const USER32 = `
 using System;
@@ -51,6 +39,14 @@ public static class User32 {
   }
 }`;
 
+// Prepend this to every User32-backed script. Each `ps()` spawns a FRESH
+// powershell.exe process, so the type must be (re)defined in-process — the
+// bootstrap process's Add-Type does NOT carry over. Defining it inline is what
+// makes every action self-contained (see issue #5896).
+const USER32_DEF = `Add-Type -TypeDefinition @'
+${USER32}
+'@ -ErrorAction SilentlyContinue; [User32] | Out-Null;`;
+
 function recordingsDir() {
   return process.env.CODEWHALE_CU_RECORDINGS_DIR || path.join(os.homedir(), ".codewhale-cu", "recordings");
 }
@@ -65,16 +61,44 @@ const VK = {
 };
 const MODVK = { ctrl: 0x11, control: 0x11, alt: 0x12, shift: 0x10, win: 0x5b, meta: 0x5b, cmd: 0x5b };
 
-export function create() {
+export function create(opts = {}) {
+  // Allow tests (and other embedders) to inject a runner so no real
+  // powershell.exe is spawned. Defaults to the production runner.
+  const injectedRun = opts.exec && typeof opts.exec.run === "function" ? opts.exec.run : null;
+  const runner = injectedRun ?? run;
+
+  async function ps(script, o = {}) {
+    const encoded = Buffer.from(script, "utf16le").toString("base64");
+    return runner("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
+      timeoutMs: o.timeoutMs ?? 25_000,
+      maxBuffer: 32 * 1024 * 1024,
+    });
+  }
+
+  async function psJson(script, o = {}) {
+    const r = await ps(script, o);
+    const out = r.stdout.trim();
+    const j = tryJson(out, null);
+    if (!j) throw new ExecError(`powershell did not return JSON: ${(r.stderr || out).trim().slice(0, 300)}`, r);
+    return j;
+  }
+
   const bootstrapped = (async () => {
     await ps(`Add-Type -TypeDefinition @'\n${USER32}\n'@ -ErrorAction SilentlyContinue; [User32] | Out-Null`, { timeoutMs: 30_000 });
   })();
   let lastRaster = null;
   let recording = null; // {id, pid, file, startedAt, mode}
 
-  async function withUser32(script, opts) {
+  // Every User32-backed action runs in its own powershell.exe, so the type must
+  // be defined in that process (USER32_DEF). A nonzero exit means the input was
+  // NOT delivered — fail truthfully instead of reporting success (#5896).
+  async function withUser32(script, o) {
     await bootstrapped;
-    return ps(script, opts);
+    const r = await ps(`${USER32_DEF}\n${script}`, o);
+    if (r.code !== 0) {
+      throw new ExecError(`win32 input action failed: ${(r.stderr || r.stdout || "").trim().slice(0, 300)}`, r);
+    }
+    return r;
   }
 
   return {
@@ -256,7 +280,10 @@ Write-Output '{"ok": true}';`, { timeoutMs: 20_000 });
       return { action_sent: true, from, to };
     },
     left_mouse_down: async ({ target }) => {
-      await withUser32(target ? `[User32]::SetCursorPos(${Math.round(target.x)}, ${Math.round(target.y)}) | Out-Null;` : "" + `[User32]::mouse_event([User32]::LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero); Write-Output '{"ok": true}'`);
+      const script = target
+        ? `[User32]::SetCursorPos(${Math.round(target.x)}, ${Math.round(target.y)}) | Out-Null; [User32]::mouse_event([User32]::LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero); Write-Output '{"ok": true}'`
+        : `[User32]::mouse_event([User32]::LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero); Write-Output '{"ok": true}'`;
+      await withUser32(script);
       return { action_sent: true };
     },
     left_mouse_up: async () => {
@@ -408,9 +435,11 @@ Write-Output '{"ok": true}';`, { timeoutMs: 10_000 });
     },
     cursor_position: async () => {
       await bootstrapped;
-      const j = await psJson(`$p = New-Object User32+POINT;
+      const r = await withUser32(`$p = New-Object User32+POINT;
 [void][User32]::GetCursorPos([ref]$p);
 Write-Output ('{"x": ' + $p.X + ', "y": ' + $p.Y + '}');`);
+      const j = tryJson(r.stdout.trim(), null);
+      if (!j) throw new ExecError("win32 cursor_position did not return JSON", r);
       return { x: j.x, y: j.y };
     },
     recordingStart: async ({ fps = 15, region } = {}) => {
